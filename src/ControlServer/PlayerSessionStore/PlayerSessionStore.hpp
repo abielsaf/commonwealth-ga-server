@@ -123,6 +123,13 @@ public:
                                    uint32_t hair_asm_id = 1974,  // NewHair15 / type-850 (0 and 403 both crash at gameplay time)
                                    uint32_t skin_mat_param_id = 0,
                                    uint32_t eye_mat_param_id = 0);
+    // Appearance change from the Dome City services (Cyber Cuts / Genolab),
+    // delivered as UPDATE_CHAR_VISUAL_SETTINGS. Both fields are optional:
+    // hair_asm_id 0 and an empty morph_data each mean "leave as-is", since the
+    // face menu sends no hair and the hair menu can be submitted unchanged.
+    static bool UpdateCharacterVisuals(int64_t character_id, int64_t user_id,
+                                       uint32_t hair_asm_id,
+                                       const std::vector<uint8_t>& morph_data);
     static std::vector<CharacterInfo> GetCharactersByUserId(int64_t user_id);
     static std::optional<CharacterInfo> GetCharacterById(int64_t id);
     // Soft-delete: stamps deleted_at, never removes the row (stats/history/

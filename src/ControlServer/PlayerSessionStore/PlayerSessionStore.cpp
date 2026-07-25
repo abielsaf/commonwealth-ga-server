@@ -568,6 +568,46 @@ bool PlayerSessionStore::SoftDeleteCharacter(int64_t character_id, int64_t user_
 	return sqlite3_changes(db) > 0;
 }
 
+bool PlayerSessionStore::UpdateCharacterVisuals(int64_t character_id, int64_t user_id,
+                                                uint32_t hair_asm_id,
+                                                const std::vector<uint8_t>& morph_data) {
+	if (hair_asm_id == 0 && morph_data.empty()) return false;
+
+	std::lock_guard<std::mutex> lock(mutex_);
+	sqlite3* db = Database::GetConnection();
+
+	// COALESCE-style partial update: a NULL bind leaves the column alone, so one
+	// statement serves the hair menu (hair + morphs), the face menu (morphs
+	// only) and a no-op submit.
+	sqlite3_stmt* stmt = nullptr;
+	int rc = sqlite3_prepare_v2(db,
+		"UPDATE ga_characters SET "
+		"  hair_asm_id = COALESCE(?, hair_asm_id), "
+		"  morph_data  = COALESCE(?, morph_data) "
+		"WHERE id = ? AND user_id = ? AND deleted_at = 0",
+		-1, &stmt, nullptr);
+	if (rc != SQLITE_OK || !stmt) {
+		Logger::Log("db", "[PlayerSessionStore] UpdateCharacterVisuals prepare failed: %s\n", sqlite3_errmsg(db));
+		return false;
+	}
+
+	// 403 (PC_CHARBUILD_Bald) is character-builder-only and crashes the in-game
+	// attach path -- same guard the creation path uses.
+	if (hair_asm_id > 0 && hair_asm_id != 403) sqlite3_bind_int(stmt, 1, (int)hair_asm_id);
+	else                                       sqlite3_bind_null(stmt, 1);
+
+	if (!morph_data.empty()) sqlite3_bind_blob(stmt, 2, morph_data.data(), (int)morph_data.size(), SQLITE_TRANSIENT);
+	else                     sqlite3_bind_null(stmt, 2);
+
+	sqlite3_bind_int64(stmt, 3, character_id);
+	sqlite3_bind_int64(stmt, 4, user_id);
+
+	if (sqlite3_step(stmt) != SQLITE_DONE)
+		Logger::Log("db", "[PlayerSessionStore] UpdateCharacterVisuals update failed: %s\n", sqlite3_errmsg(db));
+	sqlite3_finalize(stmt);
+	return sqlite3_changes(db) > 0;
+}
+
 void PlayerSessionStore::SetSelectedCharacter(const std::string& session_guid, int64_t char_id, uint32_t profile_id) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = by_guid_.find(session_guid);

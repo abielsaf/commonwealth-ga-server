@@ -370,6 +370,11 @@ int main(int argc, char* argv[]) {
     ControlServerConfig cfg = ControlServerConfig::Load(config_path);
     cfg.wine_debug = wine_debug;
 
+    // Mirror the console output into <log_dir>/control-<channel>.txt. The
+    // control server previously logged to stderr only, so anything it saw had
+    // to be scraped from the console window.
+    Logger::LogDir = cfg.log_dir;
+
     // Signal handlers for clean shutdown
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);

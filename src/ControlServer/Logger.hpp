@@ -19,6 +19,11 @@
 class Logger {
 public:
     static std::vector<std::string> EnabledChannels;
+    // When set, every line is also appended to <LogDir>/control-<channel>.txt.
+    // The DLL writes <log_dir>/<instance>/<channel>.txt, so the control-
+    // prefixed files at the log_dir root never collide with an instance's.
+    // Empty (the default) = stderr only.
+    static std::string LogDir;
 
     static inline const char* GetTime() {
         auto now = std::chrono::system_clock::now();
@@ -57,9 +62,18 @@ public:
 
         fprintf(stderr, "[%s] [%s] %s", GetTime(), Channel, buf);
         fflush(stderr);
+
+        if (!LogDir.empty()) {
+            std::string path = LogDir + "/control-" + Channel + ".txt";
+            if (FILE* f = fopen(path.c_str(), "a")) {
+                fprintf(f, "[%s] %s", GetTime(), buf);
+                fclose(f);
+            }
+        }
     }
 };
 
 // Static member definitions — included once per translation unit via this header.
 // Use inline to avoid ODR violations across multiple TUs.
 inline std::vector<std::string> Logger::EnabledChannels;
+inline std::string Logger::LogDir;

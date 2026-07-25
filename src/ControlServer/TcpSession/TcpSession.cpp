@@ -11,6 +11,7 @@
 #include "src/ControlServer/MatchmakingService/RoleWeightedSplit.hpp"
 #include "src/ControlServer/MmrService/MmrService.hpp"
 #include "src/Shared/IpcProtocol.hpp"
+#include <algorithm>
 #include <set>
 #include <map>
 #include <array>
@@ -1482,10 +1483,17 @@ void TcpSession::handle_packet(const uint8_t* data, size_t length) {
 			Logger::Log("tcp", "[%s] Received: PLAYER_UPDATE_CLIENT [0x%04X], item count: %d\n", Logger::GetTime(), packet_type, item_count);
 			send_player_update_client_response();
 			break;
-		case GA_U::GET_LOOT_TABLE_ITEMS_BY_ID_FILTERED:
-			Logger::Log("tcp", "[%s] Received: GET_LOOT_TABLE_ITEMS_BY_ID_FILTERED [0x%04X], item count: %d\n", Logger::GetTime(), packet_type, item_count);
-			send_get_loot_table_items_by_id_filtered_response();
+		case GA_U::GET_LOOT_TABLE_ITEMS_BY_ID_FILTERED: {
+			// PROFILE_ID also rides along (the "filtered" half: class-restricted
+			// vendor stock). Every table we serve today is class-agnostic, so the
+			// loot table id alone selects the rows.
+			PacketView pkt(data + 6, length - 6);
+			const uint32_t nLootTableId = pkt.Read4B(GA_T::LOOT_TABLE_ID).value_or(0);
+			Logger::Log("tcp", "[%s] Received: GET_LOOT_TABLE_ITEMS_BY_ID_FILTERED [0x%04X], item count: %d, lootTable=%u\n",
+				Logger::GetTime(), packet_type, item_count, nLootTableId);
+			send_get_loot_table_items_by_id_filtered_response(nLootTableId);
 			break;
+		}
 		case GA_U::RELAY_LOG: {
 			// Phase 10: IPC GAME_EVENT will populate event queues here.
 			// For now, RELAY_LOG is a keepalive -- no action needed.
@@ -1652,6 +1660,49 @@ void TcpSession::handle_packet(const uint8_t* data, size_t length) {
 			// NetConnection__Cleanup.cpp:84 when called on a live connection,
 			// then re-enable an immediate teardown here.
 			route_from_mission_instance(parent_instance_id, "client change-instance");
+			break;
+		}
+		case GA_U::UPDATE_CHAR_VISUAL_SETTINGS: {
+			// The Dome City appearance services (Cyber Cuts 495 / Genolab 496).
+			// Field set read straight off the client's sender at 0x114b9bb0:
+			// CURRENCY_TYPE_VALUE_ID, PRICE, LOOT_TABLE_ID, LOOT_TABLE_ITEM_ID,
+			// ITEM_ID, HAIR_ASM_ID, DWORDS. The DWORDS blob is the same layout
+			// ADD_PLAYER_CHARACTER sends -- 4B length prefix then alternating
+			// uint32 (morph node index, weight) pairs -- so it drops straight
+			// into ga_characters.morph_data, which CosmeticEquip::LoadFromDB
+			// already scatters into r_nMorphSettings at spawn.
+			PacketView pkt(data + 6, length - 6);
+			uint32_t currencyType   = pkt.Read4B(GA_T::CURRENCY_TYPE_VALUE_ID).value_or(0);
+			uint32_t price          = pkt.Read4B(GA_T::PRICE).value_or(0);
+			uint32_t lootTableId    = pkt.Read4B(GA_T::LOOT_TABLE_ID).value_or(0);
+			uint32_t lootTableItem  = pkt.Read4B(GA_T::LOOT_TABLE_ITEM_ID).value_or(0);
+			uint32_t itemId         = pkt.Read4B(GA_T::ITEM_ID).value_or(0);
+			// Hair menu only -- the face menu leaves this out, so 0 = unchanged.
+			uint32_t hairAsmId      = pkt.Read4B(GA_T::HAIR_ASM_ID).value_or(0);
+
+			std::vector<uint8_t> morphBlob;
+			auto dwordsRaw = pkt.ReadNBytes(GA_T::DWORDS);
+			if (dwordsRaw && dwordsRaw->size() > 4)
+				morphBlob.assign(dwordsRaw->begin() + 4, dwordsRaw->end());
+
+			Logger::Log("tcp", "[%s] UPDATE_CHAR_VISUAL_SETTINGS: charId=%lld lootTable=%u item=%u "
+				"lootItem=%u hair=%u currency=%u price=%u morphBytes=%u\n",
+				Logger::GetTime(), (long long)selected_character_id_, lootTableId, itemId,
+				lootTableItem, hairAsmId, currencyType, price, (unsigned)morphBlob.size());
+
+			if (selected_character_id_ == 0) {
+				Logger::Log("tcp", "[%s] UPDATE_CHAR_VISUAL_SETTINGS: no selected character -- ignored\n",
+					Logger::GetTime());
+				break;
+			}
+
+			const bool ok = PlayerSessionStore::UpdateCharacterVisuals(
+				selected_character_id_, user_id_, hairAsmId, morphBlob);
+			Logger::Log("tcp", "[%s] UPDATE_CHAR_VISUAL_SETTINGS: persisted=%d\n",
+				Logger::GetTime(), (int)ok);
+			// No response: the client already applied the change to its own
+			// pawn locally. The saved values take effect server-side on the
+			// next spawn via CosmeticEquip::LoadFromDB.
 			break;
 		}
 		case GA_U::ADD_PLAYER_CHARACTER: {
@@ -3011,8 +3062,98 @@ void TcpSession::send_quest_abandon_response(int nQuestId) {
 	send_response(response);
 }
 
-void TcpSession::send_get_loot_table_items_by_id_filtered_response()
+void TcpSession::send_get_loot_table_items_by_id_filtered_response(uint32_t nLootTableId)
 {
+	// Vendor stock for one loot table. Every vendor volume in the world routes
+	// through here -- the shops, and the Dome City appearance services
+	// (495 Cyber Cuts -> item 6019, 496 Genolab -> item 6128).
+	struct StockItem {
+		uint32_t loot_table_item_id;
+		uint32_t item_id;
+	};
+	struct StockPrice {
+		uint32_t loot_table_item_id;
+		uint32_t price;
+		uint32_t currency;
+	};
+
+	std::vector<StockItem>  items;
+	std::vector<StockPrice> prices;
+
+	sqlite3* db = Database::GetConnection();
+	if (db) {
+		sqlite3_stmt* stmt = nullptr;
+		if (sqlite3_prepare_v2(db,
+			"SELECT loot_table_item_id, item_id "
+			"FROM asm_data_set_loot_table_items "
+			"WHERE loot_table_id = ? ORDER BY sort_order, loot_table_item_id",
+			-1, &stmt, nullptr) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, static_cast<int>(nLootTableId));
+			while (sqlite3_step(stmt) == SQLITE_ROW) {
+				items.push_back({
+					static_cast<uint32_t>(sqlite3_column_int(stmt, 0)),
+					static_cast<uint32_t>(sqlite3_column_int(stmt, 1)),
+				});
+			}
+		}
+		if (stmt) sqlite3_finalize(stmt);
+
+		// Prices are sparse -- an item with no row is free. The appearance
+		// services have none, which is what makes them cost nothing here.
+		stmt = nullptr;
+		if (sqlite3_prepare_v2(db,
+			"SELECT p.loot_table_item_id, p.price, p.currency "
+			"FROM asm_data_set_loot_table_item_prices p "
+			"JOIN asm_data_set_loot_table_items i "
+			"  ON i.loot_table_item_id = p.loot_table_item_id "
+			"WHERE i.loot_table_id = ?",
+			-1, &stmt, nullptr) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, static_cast<int>(nLootTableId));
+			while (sqlite3_step(stmt) == SQLITE_ROW) {
+				prices.push_back({
+					static_cast<uint32_t>(sqlite3_column_int(stmt, 0)),
+					static_cast<uint32_t>(sqlite3_column_int(stmt, 1)),
+					static_cast<uint32_t>(sqlite3_column_int(stmt, 2)),
+				});
+			}
+		}
+		if (stmt) sqlite3_finalize(stmt);
+	}
+
+	// Price-less items still need a row, and both the currency type and a
+	// non-zero amount matter:
+	//   - the appearance menus only recognise 1605 (Agenda Points) and 1604
+	//     (Tokens); the response parser sets m_bHasAPPrices for 1605 and
+	//     m_bHasNonAPPrices for 1604 and nothing at all for 1603 (Credits).
+	//     With neither flag set the menu treats the service as unpriced and
+	//     leaves Submit disabled.
+	//   - price 0 takes a dead branch: SubmitButtonPressed (0x114ba2a0) skips
+	//     building the confirmation text when the price is zero, which is why
+	//     the confirm popup came up blank.
+	// Price-less items still need a row, and the currency type matters. The
+	// client's response parser sets m_bHasAPPrices for 1605 (Agenda Points) and
+	// m_bHasNonAPPrices for 1604 (Tokens), and nothing at all for 1603
+	// (Credits). With neither flag set the vendor/appearance menus treat the
+	// item as unpriced and disable Submit -- confirmed in game, and confirmed
+	// again by flipping this to 1605, which switched the confirm dialog's text
+	// and balance line to Agenda Points.
+	//
+	// Price 0 = free, which is what the appearance services want while currency
+	// is unimplemented. Cosmetic quirk: SubmitButtonPressed (0x114ba2a0) skips
+	// building the confirmation text when the price is zero, so their confirm
+	// dialog comes up blank. A non-zero price renders it properly but is
+	// unaffordable at a 0 balance, so free wins until currency exists.
+	for (const auto& it : items) {
+		const bool bHasPrice = std::any_of(prices.begin(), prices.end(),
+			[&](const StockPrice& p) { return p.loot_table_item_id == it.loot_table_item_id; });
+		if (!bHasPrice) {
+			prices.push_back({ it.loot_table_item_id, 0, 1604 });
+		}
+	}
+
+	Logger::Log("tcp", "[%s] GET_LOOT_TABLE_ITEMS_BY_ID_FILTERED: lootTable=%u -> %d items, %d prices\n",
+		Logger::GetTime(), nLootTableId, (int)items.size(), (int)prices.size());
+
 	std::vector<uint8_t> response;
 
 	uint16_t packet_type = GA_U::GET_LOOT_TABLE_ITEMS_BY_ID_FILTERED;
@@ -3022,26 +3163,37 @@ void TcpSession::send_get_loot_table_items_by_id_filtered_response()
 	append(response, item_count & 0xFF, item_count >> 8);
 
 	append(response, GA_T::DATA_SET & 0xFF, GA_T::DATA_SET >> 8);
-	append(response, 0x01, 0x00);        // count elements
-	{
-		append(response, 0x06, 0x00);  // inner item count
+	append(response, static_cast<uint8_t>(items.size() & 0xFF),
+	                 static_cast<uint8_t>(items.size() >> 8));
+	// EXACTLY the fields the client's parser reads, in its order, and nothing
+	// else. The retail parser (hair menu @0x114bb786, vendor scene @0x114b3385)
+	// pulls LOOT_TABLE_ITEM_ID / ITEM_ID / ITEM_SPECIAL_TYPE_VALUE_ID from this
+	// set and ignores the rest. Extra fields are not free: width comes from the
+	// field id, so writing 4 raw bytes into AUTO_CREATE_FLAG (0x005D, declared
+	// TYPE_TCP_WCHAR_STR) desyncs the reader mid-record and loses the whole data
+	// set -- that is why every vendor in Dome City showed an empty inventory.
+	for (const auto& it : items) {
+		append(response, 0x03, 0x00);  // inner item count
 
-		Write4B(response, GA_T::LOOT_TABLE_ITEM_ID, 3470);
-		Write4B(response, GA_T::ITEM_ID, 2991);
-		Write4B(response, GA_T::CREATED_ITEM_ID, 2991);
-		Write4B(response, GA_T::AUTO_CREATE_FLAG, 122319617);
-		Write4B(response, GA_T::MAX_QUALITY_VALUE_ID, 1165);
-		Write4B(response, GA_T::SORT_ORDER, 0);
+		Write4B(response, GA_T::LOOT_TABLE_ITEM_ID, it.loot_table_item_id);
+		Write4B(response, GA_T::ITEM_ID, it.item_id);
+		// No special-type column in the asm capture; 0 = none.
+		Write4B(response, GA_T::ITEM_SPECIAL_TYPE_VALUE_ID, 0);
 	}
 
 	append(response, GA_T::DATA_SET_PRICES & 0xFF, GA_T::DATA_SET_PRICES >> 8);
-	append(response, 0x01, 0x00);        // count elements
-	{
-		append(response, 0x03, 0x00);  // inner item count
+	append(response, static_cast<uint8_t>(prices.size() & 0xFF),
+	                 static_cast<uint8_t>(prices.size() >> 8));
+	// The parser reads CURRENT_PRICE (0x5F6), PRICE (0x3D6) and
+	// CURRENCY_TYPE_VALUE_ID (0x5F5). PRICE is the undiscounted list price;
+	// with no discount system, both carry the same value.
+	for (const auto& p : prices) {
+		append(response, 0x04, 0x00);  // inner item count
 
-		Write4B(response, GA_T::LOOT_TABLE_ITEM_ID, 3470);
-		Write4B(response, GA_T::CURRENT_PRICE, 0);
-		Write4B(response, GA_T::CURRENCY_TYPE_VALUE_ID, 1603);
+		Write4B(response, GA_T::LOOT_TABLE_ITEM_ID, p.loot_table_item_id);
+		Write4B(response, GA_T::CURRENT_PRICE, p.price);
+		Write4B(response, GA_T::PRICE, p.price);
+		Write4B(response, GA_T::CURRENCY_TYPE_VALUE_ID, p.currency);
 	}
 
 	send_response(response);

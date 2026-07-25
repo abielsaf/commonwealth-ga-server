@@ -10618,6 +10618,32 @@ void Database::Init() {
 			"Electrocutioner/Magma Lord @0.25\n");
 	}
 
+	if (version < 154) {
+		// v154: undo v153. v153 re-pointed VR ui volumes 126/237 at the Dome
+		// City appearance services (Cyber Cuts 6316/495, Genolab 6474/496) on
+		// the theory that the client reads ui-volume definitions from us. It
+		// does not: nothing here ever sends DATA_SET_UI_VOLUMES (0x01C3), and
+		// the game loads them from the local assembly.dat. This table is a
+		// capture mirror (AsmDataCapture::WalkUiVolumes), so writing it changed
+		// nothing in game -- volume 126 still opened the instance browser.
+		// Restore the captured values so the mirror matches assembly.dat again.
+		result = sqlite3_exec(db,
+			"UPDATE asm_data_set_ui_volumes SET "
+			"  volume_type_value_id = 1255, use_msg_id = 39866, "
+			"  ui_scene_res_id = 0, loot_table_id = 0, map_game_id = 1175, "
+			"  name_msg_translated = 'Travel to Dome City' "
+			"WHERE ui_volume_id = 126;"
+			"UPDATE asm_data_set_ui_volumes SET "
+			"  volume_type_value_id = 1252, use_msg_id = 59912, "
+			"  ui_scene_res_id = 0, loot_table_id = 0, map_game_id = 0, "
+			"  name_msg_translated = 'Arena Taskforce Change' "
+			"WHERE ui_volume_id = 237;",
+			nullptr, nullptr, &err);
+		if (result != SQLITE_OK) { Logger::Log("db", "Failed v154 (revert v153): %s\n", err); return; }
+
+		Logger::Log("db", "v154: reverted v153 -- ui volumes 126/237 restored to captured values\n");
+	}
+
 	// VR heal pad: enforce the pad device unconditionally (idempotent) —
 	// branch-divergent DBs have version counters past the v101/v102 gates.
 	// 2064 = Medical Station pulse (1.0s refire, FX 432 visual pulse);
@@ -10629,7 +10655,7 @@ void Database::Init() {
 		nullptr, nullptr, &err);
 	if (result != SQLITE_OK) { Logger::Log("db", "Failed VR heal pad device enforce: %s\n", err); return; }
 
-	result = sqlite3_exec(db, "UPDATE version_info SET version = 152", nullptr, nullptr, &err);
+	result = sqlite3_exec(db, "UPDATE version_info SET version = 154", nullptr, nullptr, &err);
 	if (result != SQLITE_OK) {
 		Logger::Log("db", "Failed to update version_info: %s\n", err);
 		return;

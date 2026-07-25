@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <thread>
 #include <mutex>
 #include <map>
@@ -112,6 +113,11 @@ private:
     asio::io_context& io_ctx_;
     std::vector<uint8_t> data_;
     std::vector<uint8_t> rx_buffer_;
+    // Accumulates continuation chunks of a chunked inbound message until its
+    // final chunk arrives. Empty whenever no chunked message is in flight.
+    std::vector<uint8_t> rx_pending_;
+    // Payload bytes per continuation chunk, both directions (see send_response).
+    static constexpr size_t kChunkPayload = 1456;
 
     std::string player_name;
     std::string session_guid_;
@@ -385,7 +391,8 @@ private:
         // The 0x0000 prefix tells the client "this is a continuation chunk,
         // accumulate". A non-zero length prefix tells the client "this is
         // the final chunk of size N, marshal is complete after these bytes".
-        constexpr size_t kChunkPayload = 1456;
+        // The framing is symmetric -- do_read reassembles inbound chunks the
+        // same way, which is why kChunkPayload lives at class scope.
 
         std::vector<uint8_t> response;
 
@@ -464,15 +471,51 @@ private:
                     while (rx_buffer_.size() >= 2) {
                         const uint16_t frame_len = static_cast<uint16_t>(
                             rx_buffer_[0] | (rx_buffer_[1] << 8));
+                        // A zero length prefix is a CONTINUATION chunk, not an
+                        // empty frame: [0x0000][kChunkPayload bytes], repeated,
+                        // terminated by a [len][remainder] final chunk. Same
+                        // framing send_response uses outbound -- the protocol is
+                        // symmetric, and the client chunks too. Previously we
+                        // dropped the 2-byte header and re-read the payload as a
+                        // frame length, which desynced the stream and silently
+                        // ate the message. Only UPDATE_CHAR_VISUAL_SETTINGS is
+                        // big enough to hit this (up to 255 morph nodes -> ~2KB),
+                        // which is why nothing else ever broke.
                         if (frame_len == 0) {
-                            rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + 2);
+                            if (rx_buffer_.size() < 2 + kChunkPayload) break;  // await the rest
+                            rx_pending_.insert(rx_pending_.end(),
+                                               rx_buffer_.begin() + 2,
+                                               rx_buffer_.begin() + 2 + kChunkPayload);
+                            rx_buffer_.erase(rx_buffer_.begin(),
+                                             rx_buffer_.begin() + 2 + kChunkPayload);
                             continue;
                         }
                         const size_t total_len = static_cast<size_t>(frame_len) + 2;
                         if (rx_buffer_.size() < total_len) {
                             break;
                         }
-                        handle_packet(rx_buffer_.data(), total_len);
+                        if (!rx_pending_.empty()) {
+                            // Final chunk of a chunked message: stitch the parts
+                            // back together and hand handle_packet a synthetic
+                            // frame, since it expects a 2-byte length prefix.
+                            rx_pending_.insert(rx_pending_.end(),
+                                               rx_buffer_.begin() + 2,
+                                               rx_buffer_.begin() + total_len);
+                            std::vector<uint8_t> frame;
+                            frame.reserve(rx_pending_.size() + 2);
+                            const uint16_t msg_len = static_cast<uint16_t>(rx_pending_.size());
+                            frame.push_back(static_cast<uint8_t>(msg_len & 0xFF));
+                            frame.push_back(static_cast<uint8_t>(msg_len >> 8));
+                            frame.insert(frame.end(), rx_pending_.begin(), rx_pending_.end());
+                            Logger::Log("tcp",
+                                "[TCP] reassembled chunked inbound: opcode=0x%04X payload=%zu\n",
+                                (unsigned)(frame.size() >= 4 ? (frame[2] | (frame[3] << 8)) : 0),
+                                rx_pending_.size());
+                            rx_pending_.clear();
+                            handle_packet(frame.data(), frame.size());
+                        } else {
+                            handle_packet(rx_buffer_.data(), total_len);
+                        }
                         rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + total_len);
                     }
                     do_read();
@@ -509,7 +552,7 @@ private:
     // path so the player still ends up somewhere sensible.
     void initiate_player_register_for_target(const struct InstanceInfo& target, int task_force);
 
-    void send_get_loot_table_items_by_id_filtered_response();
+    void send_get_loot_table_items_by_id_filtered_response(uint32_t nLootTableId);
 
     void send_inventory_response(int nPawnId, int64_t character_id);
 
